@@ -1,4 +1,6 @@
-const qrcode = require('qrcode-terminal');
+// const qrcode = require('qrcode-terminal');
+const qrcode = require('qrcode');
+const open = require('open').default;
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -17,6 +19,9 @@ app.use('/media', express.static(path.join(__dirname)));
 app.use('/upload', express.raw({ type: '*/*', limit: '50mb' }));
 
 const sockets = {}; // Store socket instances per user
+const latestQRCodes = {}; // username => base64 QR
+const connectionStatus = {}; // username => true when connected
+
 
 async function createNewSession(username) {
   const userAuthPath = path.join(__dirname, 'auth', username);
@@ -27,20 +32,43 @@ async function createNewSession(username) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // sock.ev.on('connection.update', (update) => {
+  //   const { connection, lastDisconnect, qr } = update;
+  //   if (qr) {
+  //     console.log(`\n📲 [${username}] Scan this QR with your WhatsApp:\n`);
+  //     qrcode.generate(qr, { small: true });
+  //   }
+  //   if (connection === 'close') {
+  //     const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
+  //     console.log(`[${username}] Connection closed. Reconnecting: ${shouldReconnect}`);
+  //     if (shouldReconnect) createNewSession(username);
+  //   } else if (connection === 'open') {
+  //     console.log(`✅ [${username}] Connected to WhatsApp!`);
+  //   }
+  // });
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
+
     if (qr) {
-      console.log(`\n📲 [${username}] Scan this QR with your WhatsApp:\n`);
-      qrcode.generate(qr, { small: true });
+      // Save the latest QR
+      qrcode.toDataURL(qr, (err, url) => {
+        if (!err) {
+          latestQRCodes[username] = url;
+        }
+      });
     }
+
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
       console.log(`[${username}] Connection closed. Reconnecting: ${shouldReconnect}`);
       if (shouldReconnect) createNewSession(username);
     } else if (connection === 'open') {
       console.log(`✅ [${username}] Connected to WhatsApp!`);
+      connectionStatus[username] = true;
+      delete latestQRCodes[username];
     }
   });
+
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
@@ -187,14 +215,25 @@ function listenForCommands() {
 }
 
 // Prompt and create a new user
+// function promptNewUser() {
+//   rl.question('👤 Enter username for new session: ', async (username) => {
+//     if (sockets[username]) {
+//       console.log(`⚠️ User '${username}' is already active.`);
+//     } else {
+//       await createNewSession(username);
+//     }
+//     listenForCommands(); // Go back to waiting for new command
+//   });
+// }
 function promptNewUser() {
   rl.question('👤 Enter username for new session: ', async (username) => {
     if (sockets[username]) {
       console.log(`⚠️ User '${username}' is already active.`);
     } else {
       await createNewSession(username);
+      open(`http://localhost:3000/qr/${username}`);
     }
-    listenForCommands(); // Go back to waiting for new command
+    listenForCommands();
   });
 }
 
@@ -203,9 +242,21 @@ async function restoreAllUsers() {
   const authDir = path.join(__dirname, 'auth');
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir);
 
-  const users = fs.readdirSync(authDir, { withFileTypes: true })
+  let users = fs.readdirSync(authDir, { withFileTypes: true })
     .filter(entry => entry.isDirectory())
     .map(entry => entry.name);
+
+  // Remove empty or invalid auth folders
+  users = users.filter(username => {
+    const userPath = path.join(authDir, username);
+    const contents = fs.readdirSync(userPath);
+    if (contents.length === 0) {
+      console.log(`🗑️ Removed empty session folder for '${username}'`);
+      fs.rmSync(userPath, { recursive: true, force: true });
+      return false;
+    }
+    return true;
+  });
 
   if (users.length === 0) {
     console.log('💬 No saved users. Type `new_user` to begin:');
@@ -223,6 +274,34 @@ async function restoreAllUsers() {
   listenForCommands(); // Always enter command listening mode
 }
 
+app.get('/qr/:username', (req, res) => {
+  const { username } = req.params;
+  const qrImage = latestQRCodes[username];
+  const isConnected = connectionStatus[username];
+
+  if (isConnected) {
+    return res.send(`<html><body><script>window.close()</script></body></html>`);
+  }
+
+  if (!qrImage) {
+    return res.send('<html><body><h2>Waiting for QR generation...</h2><meta http-equiv="refresh" content="30"/></body></html>');
+  }
+
+  res.send(`
+    <html>
+      <head><title>Scan QR</title></head>
+      <body style="text-align:center; font-family:sans-serif">
+        <h2>Scan this QR with your WhatsApp</h2>
+        <img src="${qrImage}" width="300" height="300"/>
+        <p>Waiting for connection...</p>
+        <meta http-equiv="refresh" content="30">
+      </body>
+    </html>
+  `);
+});
+
+
 restoreAllUsers();
 
 app.listen(3000, () => console.log('📡 Multi-user WhatsApp bot server running on port 3000'));
+
